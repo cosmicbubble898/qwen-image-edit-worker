@@ -3,6 +3,7 @@ Model Manager — handles loading, caching, and LoRA management for Qwen-Image-E
 """
 
 import os
+import re
 import time
 import torch
 from typing import Optional
@@ -18,6 +19,10 @@ MODEL_PRECISION = os.environ.get("MODEL_PRECISION", "bf16")
 # Phr00t v23 NSFW converted model path (baked into Docker image)
 NSFW_MODEL_DIR = os.environ.get("NSFW_MODEL_DIR", "/models/qwen-nsfw")
 NSFW_LORAS_ENV = os.environ.get("NSFW_LORAS", "")  # comma-separated LoRA names
+# Directory on the network volume holding arbitrary user LoRA .safetensors files.
+# A request's loras:[{name}] resolves `name` to a file here (or MODEL_CACHE_DIR/loras),
+# then falls back to the LORA_REGISTRY (HuggingFace) for the built-in named ones.
+LORA_DIR = os.environ.get("LORA_DIR", "/runpod-volume/loras")
 
 # Performance optimizations
 ENABLE_ATTENTION_SLICING = os.environ.get("ENABLE_ATTENTION_SLICING", "true").lower() == "true"
@@ -127,64 +132,90 @@ def _load_pipeline():
     return pipeline
 
 
-def load_lora(pipeline, lora_name: str, weight: Optional[float] = None):
-    """Load a LoRA by name from the registry."""
+def _adapter_name(name: str) -> str:
+    """diffusers adapter names must be simple identifiers — sanitize the filename."""
+    stem = os.path.splitext(os.path.basename(str(name)))[0]
+    return "lora_" + (re.sub(r"[^A-Za-z0-9_]", "_", stem)[:48] or "x")
+
+
+def _resolve_lora_file(name: str) -> Optional[str]:
+    """Find a LoRA .safetensors on disk by name. Network volume first, then the
+    baked model-cache loras dir. Tries the name as-is and with .safetensors."""
+    candidates = [name]
+    if not name.endswith(".safetensors"):
+        candidates.append(name + ".safetensors")
+    for base in (LORA_DIR, os.path.join(MODEL_CACHE_DIR, "loras")):
+        for n in candidates:
+            p = os.path.join(base, n)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def load_lora(pipeline, lora_name: str, weight: Optional[float] = None) -> Optional[str]:
+    """Load a single LoRA and return its adapter name (or None on failure).
+
+    Resolution order:
+      1. A file on the network volume / cache (arbitrary user LoRAs, by filename).
+      2. A built-in entry in LORA_REGISTRY (downloaded from HuggingFace).
+    Unknown names are logged loudly so a silent no-op is impossible to miss.
+    """
     global _loaded_loras
+    adapter = _adapter_name(lora_name)
+    if adapter in _loaded_loras:
+        return adapter
 
-    if lora_name in _loaded_loras:
-        print(f"[LORA] {lora_name} already loaded, skipping")
-        return
-
-    if lora_name not in LORA_REGISTRY:
-        print(f"[LORA] Unknown LoRA: {lora_name}. Available: {list(LORA_REGISTRY.keys())}")
-        return
-
-    info = LORA_REGISTRY[lora_name]
-    w = weight or info["default_weight"]
-
-    print(f"[LORA] Loading {lora_name} (weight={w}) from {info['repo']}...")
     start = time.time()
-
     try:
-        # Check network volume cache first
-        local_lora = os.path.join(MODEL_CACHE_DIR, "loras", info["filename"])
-        if os.path.exists(local_lora):
-            pipeline.load_lora_weights(local_lora, adapter_name=lora_name)
+        path = _resolve_lora_file(lora_name)
+        if path:
+            print(f"[LORA] Loading '{lora_name}' from volume file {path}...")
+            pipeline.load_lora_weights(path, adapter_name=adapter)
+        elif lora_name in LORA_REGISTRY:
+            info = LORA_REGISTRY[lora_name]
+            local = os.path.join(MODEL_CACHE_DIR, "loras", info["filename"])
+            if os.path.isfile(local):
+                print(f"[LORA] Loading '{lora_name}' from cache {local}...")
+                pipeline.load_lora_weights(local, adapter_name=adapter)
+            else:
+                print(f"[LORA] Loading '{lora_name}' from HuggingFace {info['repo']}...")
+                pipeline.load_lora_weights(info["repo"], weight_name=info["filename"], adapter_name=adapter)
         else:
-            pipeline.load_lora_weights(
-                info["repo"],
-                weight_name=info["filename"],
-                adapter_name=lora_name,
-            )
+            print(f"[LORA] NOT FOUND: '{lora_name}' — looked in {LORA_DIR}, "
+                  f"{os.path.join(MODEL_CACHE_DIR, 'loras')}, and registry {list(LORA_REGISTRY)}")
+            return None
 
-        pipeline.set_adapters([lora_name], adapter_weights=[w])
-        _loaded_loras.append(lora_name)
-
-        elapsed = time.time() - start
-        print(f"[LORA] {lora_name} loaded in {elapsed:.1f}s")
+        _loaded_loras.append(adapter)
+        print(f"[LORA] '{lora_name}' -> adapter '{adapter}' in {time.time() - start:.1f}s")
+        return adapter
 
     except Exception as e:
-        print(f"[LORA] Failed to load {lora_name}: {e}")
+        print(f"[LORA] FAILED to load '{lora_name}': {e}")
+        return None
 
 
 def set_runtime_loras(pipeline, loras: list[dict]):
-    """
-    Set LoRAs for a specific generation.
-    loras: [{"name": "gnass", "weight": 0.8}, ...]
+    """Load + activate the LoRAs for one generation. Stacks all that load.
+    loras: [{"name": "AnimeNSFW3-diffusers.safetensors", "weight": 1.0}, ...]
     """
     if not loras:
         return
 
+    active, weights = [], []
     for lora in loras:
         name = lora.get("name", "")
+        if not name:
+            continue
         weight = lora.get("weight")
-        if name and name not in _loaded_loras:
-            load_lora(pipeline, name, weight)
+        weight = 1.0 if weight is None else float(weight)
+        adapter = load_lora(pipeline, name, weight)
+        if adapter:
+            active.append(adapter)
+            weights.append(weight)
 
-    # Set all active adapters
-    names = [l["name"] for l in loras if l["name"] in _loaded_loras]
-    weights = [l.get("weight", LORA_REGISTRY.get(l["name"], {}).get("default_weight", 1.0)) for l in loras if l["name"] in _loaded_loras]
-
-    if names:
-        pipeline.set_adapters(names, adapter_weights=weights)
-        print(f"[LORA] Active: {dict(zip(names, weights))}")
+    if active:
+        pipeline.set_adapters(active, adapter_weights=weights)
+        print(f"[LORA] Active adapters: {dict(zip(active, weights))}")
+    else:
+        # Requested LoRAs but none applied — surface it instead of silently no-op'ing.
+        print(f"[LORA] WARNING: requested {[l.get('name') for l in loras]} but none loaded")
