@@ -77,9 +77,14 @@ RUN if [ ! -f /models/qwen-nsfw/vae/diffusion_pytorch_model.safetensors ]; then 
         echo "VAE extracted from Phr00t checkpoint"; \
     fi
 
-# Cleanup: remove raw checkpoint and base transformer to save space
-RUN rm -rf /models/phr00t /models/qwen-base/transformer && \
-    echo "Cleanup done"
+# Cleanup: the assembled model lives in /models/qwen-nsfw. Everything else is
+# redundant and was bloating the image to ~90GB — which made the OCI export blow
+# past RunPod's 30-min build limit. Delete the raw checkpoint, the leftover base
+# copy (already merged into qwen-nsfw), and HF's blob cache. Leaves only the
+# ~36GB model, which exports comfortably in time.
+RUN rm -rf /models/phr00t /models/qwen-base /models/cache /root/.cache /tmp/* && \
+    du -sh /models/* 2>/dev/null || true && \
+    echo "Cleanup done; only /models/qwen-nsfw remains"
 
 # Verify
 RUN ls -la /models/qwen-nsfw/ && \
