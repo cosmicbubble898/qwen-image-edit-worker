@@ -52,14 +52,22 @@ RUN python3 /app/scripts/convert_checkpoint.py \
     /models/qwen-nsfw \
     /models/qwen-base
 
-# Step 4: Copy base configs into the NSFW model dir
-RUN cp -r /models/qwen-base/scheduler /models/qwen-nsfw/ 2>/dev/null || true && \
-    cp -r /models/qwen-base/tokenizer /models/qwen-nsfw/ 2>/dev/null || true && \
-    cp -r /models/qwen-base/tokenizer_2 /models/qwen-nsfw/ 2>/dev/null || true && \
-    cp -r /models/qwen-base/text_encoder /models/qwen-nsfw/ 2>/dev/null || true && \
-    cp -r /models/qwen-base/text_encoder_2 /models/qwen-nsfw/ 2>/dev/null || true && \
-    cp /models/qwen-base/model_index.json /models/qwen-nsfw/ 2>/dev/null || true && \
-    echo "Configs copied to /models/qwen-nsfw"
+# Step 4: Copy EVERY base component (except the transformer, which comes from
+# Phr00t) into the NSFW model dir. The original cherry-pick missed the image
+# processor (preprocessor_config.json), which QwenImageEditPlusPipeline requires
+# — copying everything (no-clobber, so Phr00t's own files win) avoids that whole
+# class of "forgot a component" bug. model_index.json is forced from base since
+# it must describe the full pipeline (incl. the processor).
+RUN cd /models/qwen-base && \
+    for item in $(ls -A | grep -v '^transformer$'); do \
+        if [ ! -e "/models/qwen-nsfw/$item" ]; then \
+            cp -r "$item" "/models/qwen-nsfw/" && echo "copied $item"; \
+        else \
+            echo "kept existing $item"; \
+        fi; \
+    done && \
+    cp -f /models/qwen-base/model_index.json /models/qwen-nsfw/model_index.json && \
+    echo "All base components (except transformer) ensured in /models/qwen-nsfw"
 
 # Step 5: If conversion didn't extract VAE, copy from base
 RUN if [ ! -f /models/qwen-nsfw/vae/diffusion_pytorch_model.safetensors ]; then \
